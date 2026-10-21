@@ -102,7 +102,18 @@ def load_code(path_value: str | None) -> str:
         raise ValueError(f"无法读取文件：{exc}") from exc
 
 
+def _configure_output() -> None:
+    """Keep Chinese CLI output readable under legacy Windows code pages."""
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 def main() -> int:
+    # argparse writes --help and errors before returning parsed arguments.
+    _configure_output()
     try:
         arguments = parse_arguments()
         if arguments.max_fix_attempts is not None:
