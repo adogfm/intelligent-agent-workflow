@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-validation:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -e .
+
+      - name: Compile sources
+        run: python -m compileall -q .
+
+      - name: Run offline tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Run deterministic benchmark
+        run: python -m benchmarks.run
+
+  windows-cli-smoke:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Create virtual environment
+        run: python -m venv .venv
+
+      - name: Install project into virtual environment
+        run: .\.venv\Scripts\python.exe -m pip install -e .
+
+      - name: Run installed Windows CLI entry point
+        run: .\.venv\Scripts\code-review-agent.exe --help
+
+      - name: Run CLI by command name with the virtual environment on PATH
+        shell: pwsh
+        run: |
+          $env:PATH = "${{ github.workspace }}\.venv\Scripts;$env:PATH"
+          code-review-agent --help
