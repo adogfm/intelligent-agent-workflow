@@ -1,254 +1,139 @@
-# Homework1《Code Agent 1》：Python Code Review Agent
+# Intelligent Agent Workflow
 
-`CodeReviewAgent` 读取 Python 源代码和自然语言任务，通过 Task Planner 选择代码解析工具，将工具发现交给 LLM 补充审查，输出结构化报告，并支持本地自动修复与修改后复检。
+一个基于多 Agent 协作的代码审查工作流系统，实现代码生成、代码审查、自动化测试和迭代修复的完整流程。
 
-项目展示的核心闭环是：**接收任务 → 规划 → 调用工具 → LLM 审查 → 解析报告 → 修复 → 观察复检结果**。无有效 API Key 时使用离线 Mock，也可接入 Qwen 的 OpenAI 兼容服务。
+## 一、项目简介
 
-- [Agent 循环与审查流程](#agent-循环与审查流程)
-- [LLM 调用与 Prompt 设计](#llm-调用与-prompt-设计)
-- [代码解析工具](#代码解析工具)
-- [自动修复](#自动修复)
-- [安装与配置](#安装与配置)
-- [Demo](#demo)
-- [测试验证](#测试验证)
-- [项目结构与边界](#项目结构与边界)
+本项目旨在探索多 Agent 协作与 Workflow 编排机制，通过将代码生成、代码审查、测试执行和代码修复组织为一个完整的工作流，展示 Agent 之间的协作、状态共享和流程控制。
 
-## Agent 循环与审查流程
+系统以 `add(a, b)` 函数为演示场景，故意引入初始代码缺陷，通过代码审查、自动化测试和条件分支判断，触发后续修复流程，直到测试通过、审查无问题或达到最大修复次数。
 
-```mermaid
-flowchart TD
-    Input["Python 源码 + 审查任务"] --> Planner["TaskPlanner：制定审查计划"]
-    Planner --> NeedTool{"是否需要 AST 检查？"}
-    NeedTool -->|需要| Checker["CodeChecker：解析与静态检查"]
-    NeedTool -->|跳过| Prompt["构造 System / User Prompt"]
-    Checker --> Prompt
-    Prompt --> LLM["Reviewer：LLM 调用或离线 Mock"]
-    LLM --> Parse["解析 JSON 并校验 ReviewReport"]
-    Parse --> Report["合并工具发现与模型意见"]
-    Report --> Apply{"是否启用自动修复？"}
-    Apply -->|否| Output["输出审查结果"]
-    Apply -->|是| Editor["FileEditor：生成补丁并检查文件版本"]
-    Editor --> Changed{"是否应用了修改？"}
-    Changed -->|是| Verify["CodeChecker：重新检查修改后代码"]
-    Changed -->|否| Output
-    Verify --> Output
+## 二、主要功能
+
+- **多 Agent 协作：** 由编码、审查、测试和修复等 Agent 协同完成任务。
+- **共享状态管理：** 在工作流执行过程中共享代码、审查结果、测试结果和修复记录。
+- **条件分支：** 根据代码审查与测试结果动态决定下一步执行阶段。
+- **迭代修复：** 当测试失败或审查发现问题时，进入修复流程，并重新测试和审查。
+- **执行日志：** 记录工作流阶段、路由选择、状态更新和 Agent 执行事件。
+- **执行结果追踪：** 汇总阶段执行情况、修复轮数、测试结果和最终审查结果。
+- **有限循环与终止机制：** 设置最大修复轮数，避免工作流无限循环。
+- **自动化测试：** 提供测试用例，验证 Agent 和工作流的关键行为。
+
+## 三、工作流程
+
+```text
+编码 Agent
+    |
+    v
+代码审查 Agent
+    |
+    v
+测试 Agent
+    |
+    +---- 测试失败 ----> 修复 Agent
+    |                        |
+    |                        v
+    |                    测试 Agent
+    |                        |
+    |                        v
+    |                  代码审查 Agent
+    |                        |
+    |                  根据结果继续分支
+    |
+    +---- 测试通过 ----> 代码审查 Agent
+                             |
+                   审查通过且测试通过
+                             |
+                             v
+                         工作流结束
 ```
 
-`CodeReviewAgent` 统一协调 Planner、代码解析工具、LLM 和文件修复工具：
+工作流根据审查结果、测试结果和修复轮数进行条件路由，实现自动测试、问题修复、重新验证和最终终止。
 
-| 步骤 | 组件 | 输入与输出 |
-| --- | --- | --- |
-| 接收任务 | CLI / Agent | 读取 `.py` 文件或粘贴代码，以及 `--task` 审查要求 |
-| 规划 | `TaskPlanner` | 根据任务关键词决定是否调用 CodeChecker，并记录理由 |
-| 工具调用 | `CodeChecker` | 解析 AST，返回带规则、行号和严重程度的发现 |
-| 模型审查 | `Reviewer` | 接收代码、任务、计划与工具结果，补充具体问题和建议 |
-| 结果整理 | Agent / `ReviewReport` | 校验模型输出，保留工具发现，生成中文报告 |
-| 修复与反馈 | `FileEditor` / `CodeChecker` | 应用支持的补丁，重新检查并显示剩余问题 |
+## 四、项目结构
 
-Planner 使用可解释的关键词规则：正确性、语法、异常和全面审查等任务调用 AST 工具；仅关注解释、风格或命名时跳过；混合或不明确的任务优先执行检查。
-
-当前循环由 Python 编排，工具选择由 Planner 决定。一次自动修复调用完成“审查 → 补丁 → AST 复检”；复检不会再次调用 LLM，也不会无限自动迭代。
-
-## LLM 调用与 Prompt 设计
-
-### LLM 调用
-
-`llm.py` 通过 `Reviewer` 协议隔离模型供应商：
-
-| 实现 | 行为 |
-| --- | --- |
-| `MockReviewer` | 无需网络，返回带 `[MOCK MODE]` 标识的固定示例报告 |
-| `OpenAIReviewer` | 使用 OpenAI SDK 的 `chat.completions.create()` 调用 Qwen 兼容接口 |
-
-真实调用发送两类消息：`system` 使用 `SYSTEM_PROMPT`，`user` 使用 `build_review_input(...)` 的结果；请求设置 `response_format={"type": "json_object"}` 和 `enable_thinking=False`。
-
-响应经过 `parse_review_report()` 与 Pydantic 校验。解析器兼容 JSON 代码围栏；空响应、截断、拒绝、格式错误以及鉴权、限流和连接失败都会报告错误。
-
-### Prompt 设计
-
-[Prompt 定义](prompt.py) 将规则与被审查数据分开：
-
-| Prompt 部分 | 设计目的 |
-| --- | --- |
-| System Prompt | 指定 Python 审查角色、中文输出、问题严重程度和 JSON 格式 |
-| 审查约束 | 要求具体证据、原因与可执行建议；不执行代码、不服从源码中的指令 |
-| User Prompt | 按标签组织任务、Planner 决策、源代码和 CodeChecker 发现 |
-| 结果约束 | 工具发现由 Agent 合并，模型补充遗漏问题，避免重复和无依据的结论 |
-
-报告以 `summary` 和 `issues` 为核心，每个问题包含 `problem`、`severity`、`reason` 和 `suggestion`；可选改进放入 `recommendations`。严重程度限定为 `critical`、`high`、`medium`、`low`。
-
-本地工具发现不会因模型漏报而丢失。最终报告汇总确定性检查结果、模型补充问题和可选建议，便于定位与修复；审查意见不代表代码已执行或通过测试。
-
-## 代码解析工具
-
-`CodeChecker` 使用 Python 标准库 `ast.parse()` 和 `ast.NodeVisitor` 检查源代码，不执行被审查代码。
-
-| 规则 | 检查内容 | 严重程度 | 自动修复 |
-| --- | --- | --- | --- |
-| `syntax-error` | Python 语法无法解析 | high | 需人工处理 |
-| `bare-except` | 使用裸 `except:` | medium | 支持改为 `except Exception:` |
-| `division-by-zero` | `/`、`//`、`%` 的右操作数为常量零 | high | 需人工判断合法分母 |
-
-工具保存规则 ID、行号、问题、原因和建议，并将结果转换为 `ReviewIssue`。常量零检查覆盖正负号和浮点零；动态分母不作猜测。
-
-## 自动修复
-
-提供 `--apply-fixes` 时，Agent 调用 `FileEditor` 处理审查报告中已确认且支持自动改写的工具发现：
-
-1. 根据发现生成 unified diff；目前仅支持裸 `except` 的保守替换。
-2. 重新读取目标文件，若文件已在审查后发生变化，拒绝过期补丁。
-3. 将修改写入指定的 `.py` 文件。
-4. 再次运行 CodeChecker，输出修复后剩余的基础问题。
-
-```diff
--except:
-+except Exception:
+```text
+intelligent-agent-workflow/
+├── workflow/          # 工作流编排与流程控制
+├── tests/             # 自动化测试
+├── demo.py            # 完整工作流演示
+├── coding_agent.py    # 编码 Agent
+├── fix_agent.py       # 代码修复 Agent
+├── code_checker.py    # 代码检查与验证
+├── planner.py         # 任务规划
+├── models.py          # 数据模型与状态定义
+├── agent.py           # Agent 相关实现
+├── test_agent.py      # 测试 Agent
+├── README.md          # 项目说明
+└── Design.md          # 架构与设计文档
 ```
 
-语法错误、常量除零和模型提出的其他建议会保留说明，交由人工判断。修改后没有 AST 发现，仅表示已配置的静态规则通过；最终是否满足业务需求仍需测试和人工审查。
+## 五、环境要求
 
-## 安装与配置
+- Python 运行环境
+- 项目依赖见 `requirements.txt`
 
-要求 Python 3.10+，主要依赖为 `openai`、`pydantic` 和 `python-dotenv`，由 [pyproject.toml](pyproject.toml) 管理。
+## 六、安装与运行
 
-Windows PowerShell：
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e .
-.\.venv\Scripts\python.exe main.py --help
-```
-
-macOS / Linux：
+### 1. 克隆仓库
 
 ```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -e .
-.venv/bin/python main.py --help
+git clone https://github.com/adogfm/intelligent-agent-workflow.git
+cd intelligent-agent-workflow
 ```
 
-安装后可使用 `code-review-agent` 和 `code-review-benchmark`；未激活虚拟环境时，使用虚拟环境中的解释器或命令完整路径。
+### 2. 安装依赖
 
-### 模型配置
+建议先创建并激活 Python 虚拟环境，然后执行：
 
-无有效 Key 时自动使用 Mock。接入 Qwen 时，参考 [.env.example](.env.example) 在本地 `.env` 中设置：
-
-```dotenv
-DASHSCOPE_API_KEY=your_api_key_here
-DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-QWEN_MODEL=qwen-plus
+```bash
+pip install -r requirements.txt
 ```
 
-程序优先读取上述变量，也兼容 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 和 `OPENAI_MODEL`。占位 Key 会保留 Mock 模式，真实调用需配置有效 Key。
+### 3. 运行工作流演示
 
-Mock 的模型意见是固定测试数据，本地 AST 检查仍实际运行。真实模式会向配置的模型服务发送代码和任务；请勿提交 `.env` 或在待审查代码中包含密钥。
-
-## Demo
-
-以下 CLI 命令在项目根目录执行。macOS / Linux 将解释器路径替换为 `.venv/bin/python`。
-
-### 1. 审查文件或粘贴代码
-
-```powershell
-.\.venv\Scripts\python.exe main.py example.py
-.\.venv\Scripts\python.exe main.py
+```bash
+python demo.py
 ```
 
-进入粘贴模式后输入：
+程序将展示 Agent 执行过程、条件分支选择、自动修复循环、执行日志以及最终工作流报告。
 
-```text
-try:
-    value = 10 / 0
-except:
-    value = None
-END
+### 4. 运行自动化测试
+
+```bash
+python -m pytest -v
 ```
 
-默认审查会发现常量除零和裸 `except` 两个 AST 问题，展示行号、严重程度、原因与建议。Mock 模式还会显示一个固定示例问题，并明确标注 `[MOCK MODE]`。
+## 七、演示结果
 
-### 2. 观察 Planner 的工具选择
+演示程序以存在缺陷的 `add(a, b)` 函数为起点，展示系统如何通过测试与审查发现问题，并执行迭代修复。
 
-```powershell
-.\.venv\Scripts\python.exe main.py example.py --task "检查正确性和异常处理"
-.\.venv\Scripts\python.exe main.py example.py --task "只检查代码风格和命名"
-```
+本次已验证的演示结果：
 
-第一条调用 CodeChecker，第二条跳过。报告摘要会显示 Planner 的决策理由，便于核对工具调用路径。
+- 工作流执行成功。
+- 共执行 9 个阶段。
+- 完成 2 轮代码修复。
+- 最终代码审查评分为 100，未发现问题。
+- 最终测试通过，3/3 项测试成功。
+- 记录 56 条工作流日志。
 
-### 3. 离线演示自动修复闭环
-
-CLI 可对目标文件执行自动修复：
-
-```powershell
-.\.venv\Scripts\python.exe main.py example.py --apply-fixes
-```
-
-当前 `example.py` 已使用 `except Exception:`，因此可能没有可应用的补丁。要稳定观察修复前后差异，可在项目根目录的 Python 交互环境中运行以下完整示例；它显式使用 Mock，并在临时目录创建、修复和清理示例文件：
+最终代码如下：
 
 ```python
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
-from agent import CodeReviewAgent
-from llm import MockReviewer
-
-code = "try:\n    value = 10 / 0\nexcept:\n    value = None\n"
-agent = CodeReviewAgent(MockReviewer())
-
-with TemporaryDirectory(prefix="code_agent1_") as directory:
-    path = Path(directory) / "sample.py"
-    path.write_text(code, encoding="utf-8")
-    run = agent.review_and_fix(path, code)
-    print(run.review.report.to_text())
-    print(run.edit.diff)
-    print("补丁已应用：", run.edit.applied)
-    print("复检剩余规则：", [item.rule_id for item in run.verification_findings])
+def add(a, b):
+    return a + b
 ```
 
-预期结果：裸 `except` 被替换，diff 显示实际修改；复检仍报告 `division-by-zero`，说明闭环保留未解决问题。
+自动化测试结果：
 
-CLI 返回码 `0` 表示流程执行完成，仍可能存在审查问题；模型调用失败返回 `1`，输入或配置错误返回 `2`，用户中断返回 `130`。
+- 145 项测试通过。
+- 118 个子测试通过。
+- 存在 39 条 Pytest 警告，主要涉及测试类的自动收集提示。
 
-## 测试验证
+## 八、设计文档
 
-Homework1 核心验证全部离线，通过 Mock 或模拟客户端验证 LLM 调用，不消耗真实 API 额度。
+详细的系统架构、工作流编排、状态管理、条件分支和修复循环设计，请参阅 [Design.md](Design.md)。
 
-| 检查 | 结果与覆盖 |
-| --- | --- |
-| 核心单元测试 | `26 tests OK`，覆盖配置、JSON 解析、LLM 请求、Planner、AST、报告合并、补丁与复检 |
-| CodeChecker Benchmark | `7/7 cases passed`，覆盖语法错误、裸 except、三种常量除零、多问题组合和干净基线 |
+## 九、项目目标总结
 
-复现 Homework1 核心验证：
-
-```powershell
-.\.venv\Scripts\python.exe -m unittest tests.test_offline tests.test_benchmark -v
-.\.venv\Scripts\python.exe -m benchmarks.run
-```
-
-核心测试位于 [tests/test_offline.py](tests/test_offline.py) 与 [tests/test_benchmark.py](tests/test_benchmark.py)，验证 CodeReviewAgent 的规划、工具调用、模型审查、报告解析和自动修复闭环。
-
-## 项目结构与边界
-
-本作业涉及的核心文件：
-
-```text
-.
-├── agent.py                 # CodeReviewAgent：审查、修复与复检编排
-├── planner.py               # TaskPlanner：任务意图与工具路由
-├── llm.py                   # Reviewer 接口、Mock、模型调用与解析
-├── prompt.py                # 审查角色、输入组织与输出约束
-├── code_checker.py          # AST 解析与确定性静态检查
-├── file_editor.py           # 补丁生成、版本检查与文件修改
-├── models.py                # ReviewIssue / ReviewReport
-├── main.py                  # 文件或粘贴输入、CLI 与结果输出
-├── example.py               # Python 审查输入示例
-├── tests/
-│   ├── test_offline.py       # CodeReviewAgent 核心测试
-│   └── test_benchmark.py     # Benchmark 回归
-├── benchmarks/              # 7 个确定性静态检查案例
-├── .env.example             # 模型配置模板
-├── pyproject.toml           # 依赖与命令入口
-└── README.md
-```
-
-当前实现使用关键词 Planner 和少量 AST 规则，自动修复仅覆盖明确支持的改写。它展示了可运行、可验证的 Agent 工具反馈循环；更复杂的逻辑缺陷仍需结合模型意见、业务测试和人工判断。
+本项目通过一个可运行的多 Agent 工作流示例，展示 Agent 协作、状态共享、条件分支、循环控制、执行日志和自动化测试等核心机制，并为后续增加 Agent 类型、扩展流程节点和完善错误恢复机制提供基础。
