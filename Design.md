@@ -1,367 +1,580 @@
-# Design: Python Code Review Agent
+# Intelligent Agent Workflow 设计文档
 
-## 1. 目标
+## 1. 项目目标
 
-本项目演示一个最小但工程边界清晰的代码审查 Agent：
+本项目实现一个基于多 Agent 协作的代码审查工作流系统，通过统一的 Workflow Engine，将代码生成、代码审查、自动化测试和代码修复组织为完整的执行流程。
 
-1. 接收 Python 源码和自然语言审查任务。
-2. 由 Planner 决定是否需要本地静态工具。
-3. 合并确定性 Tool 结果与可替换 Reviewer 结果。
-4. 在用户显式授权时生成并应用保守补丁。
-5. 修改后重新验证，形成可测试的闭环。
-6. 无 API Key 时完整离线运行。
+项目重点探索以下核心概念：
 
-非目标：替代成熟 linter、执行不可信代码、自动修复所有问题，或在没有明确参数时修改文件。
+1. **Agent 协作：** 不同 Agent 负责独立任务，并通过统一接口协同工作。
+2. **状态共享：** 使用统一的 WorkflowState 管理代码、审查结果、测试结果和修复记录。
+3. **流程编排：** 通过 Workflow Engine 控制节点执行顺序及后续路由。
+4. **条件分支与循环：** 根据审查和测试结果决定是否继续修复。
+5. **错误处理与恢复：** 记录执行异常、保留已有结果，并限制自动修复次数。
+6. **执行日志与报告：** 追踪各阶段状态、执行耗时、路由选择和最终结果。
+
+本项目以 Python 代码生成、审查、测试与修复为主要应用场景，同时将通用 Workflow 能力与具体代码审查逻辑分离，为后续扩展其他 Agent 和流程节点提供基础。
 
 ## 2. 总体架构
 
-```mermaid
-flowchart LR
-    Input[源码 + 审查任务] --> CLI[CLI]
-    CLI --> Agent[ReviewAgent]
-
-    subgraph Planning[决策层]
-        Agent --> Planner[TaskPlanner]
-        Planner --> Plan[ReviewPlan]
-    end
-
-    subgraph Tools[本地 Tools]
-        Plan -->|use_code_checker=true| Checker[CodeChecker]
-        Report -->|--apply-fixes| Editor[FileEditor]
-        Editor --> Verify[CodeChecker Verification]
-    end
-
-    subgraph Reviewers[Reviewer 层]
-        Factory[create_reviewer] -->|无 Key| Mock[MockReviewer]
-        Factory -->|有 Key| LLM[OpenAIReviewer / Qwen Chat Completions]
-        Mock --> Reviewer[Reviewer Protocol]
-        LLM --> Reviewer
-    end
-
-    Plan --> Reviewer
-    Checker --> Findings[CodeCheckFinding list]
-    Findings --> Reviewer
-    Findings --> Merge[Agent Merge]
-    Reviewer --> LLMReport[ReviewReport]
-    LLMReport --> Merge
-    Merge --> Report[最终 ReviewReport]
-    Verify --> Verification[修改后验证结果]
-```
-
-核心设计原则是“确定性 Tool 结果不依赖 LLM”。CodeChecker 的发现由 Agent 直接转换成最终问题，Reviewer 只能补充，不能吞掉或覆盖这些结果。
-
-## 3. 审查时序
+系统采用分层设计，将 Agent、工作流编排、共享状态和结果报告分开管理。
 
 ```mermaid
-sequenceDiagram
-    participant U as User
-    participant A as ReviewAgent
-    participant P as TaskPlanner
-    participant C as CodeChecker
-    participant R as Reviewer
-    participant E as FileEditor
+flowchart TD
+    User[用户需求与任务]
+    User --> Coding[Coding Agent]
+    Coding --> Review[Review Agent]
+    Review --> Test[Test Agent]
+    Test --> Decision{测试与审查结果}
+    Decision -->|发现问题| Fix[Fix Agent]
+    Fix --> Test
+    Decision -->|全部通过| Report[Workflow Report]
+    Decision -->|达到修复上限或无进展| Report
 
-    U->>A: code, task, optional --apply-fixes
-    A->>P: plan(task)
-    P-->>A: ReviewPlan
-    opt Planner 决定调用
-        A->>C: check(code)
-        C-->>A: findings
-    end
-    A->>R: review(code, task, plan, findings)
-    R-->>A: reviewer report
-    A->>A: 合并 Tool 与 Reviewer 结果
-    opt --apply-fixes
-        A->>E: apply(path, code, report, findings)
-        E-->>A: diff + updated code
-        A->>C: check(updated code)
-        C-->>A: verification findings
-    end
-    A-->>U: report, optional patch and verification
+    State[(WorkflowState)]
+    Coding -.读写状态.-> State
+    Review -.读写状态.-> State
+    Test -.读写状态.-> State
+    Fix -.读写状态.-> State
+
+    Engine[Workflow Engine]
+    Engine --> Coding
+    Engine --> Review
+    Engine --> Test
+    Engine --> Fix
+    Engine --> Report
 ```
 
-## 4. 模块说明
+### 2.1 架构分层
 
-| 模块 | 核心类型/入口 | 设计职责 |
-| --- | --- | --- |
-| `main.py` | `main()` | 解析 CLI、读取代码、控制是否写文件、统一错误输出和退出码 |
-| `agent.py` | `ReviewAgent`、兼容 `CodeReviewAgent`、`ReviewRun`、`ReviewAndFixRun` | 单一编排入口，维持 Tool/Reviewer 独立性，合并结果并触发复检 |
-| `planner.py` | `TaskPlanner`, `ReviewPlan` | 将任务文本映射为透明、确定性的 Tool 调用决策 |
-| `code_checker.py` | `CodeChecker`, `CodeCheckFinding` | 仅使用 AST 的本地静态分析，不执行代码 |
-| `file_editor.py` | `FileEditor`, `GeneratedPatch`, `FileEditResult` | 白名单式生成 diff、检查文件新鲜度、应用补丁 |
-| `llm.py` | `Reviewer`, `MockReviewer`, `OpenAIReviewer`, `parse_review_report()` | 定义 Reviewer 边界，调用千问 OpenAI 兼容 Chat API，并将 JSON 校验为报告 |
-| `prompt.py` | `SYSTEM_PROMPT`, `build_review_input()` | 将任务、Plan、源码和 Tool 结果组织成 LLM 上下文 |
-| `models.py` | `ReviewIssue`, `ReviewReport` | 统一结构化输出和终端渲染 |
-| `benchmarks/` | `BENCHMARK_CASES`, `run_benchmark()` | 确定性回归任务及 CI 退出码 |
+| 层次 | 主要模块 | 职责 |
+|---|---|---|
+| Agent 层 | `coding_agent.py`、`agent.py`、`test_agent.py`、`fix_agent.py` | 分别完成代码生成、审查、测试和修复 |
+| Workflow 层 | `workflow/` | 管理节点执行、条件路由、状态提交、循环及异常处理 |
+| 状态与数据层 | `models.py`、WorkflowState 及相关数据模型 | 保存共享数据、执行状态、结果和历史记录 |
+| 工具与供应商层 | `code_checker.py`、`file_editor.py`、`llm.py` 等 | 提供代码检查、补丁处理及模型调用能力 |
+| 报告与验证层 | `workflow/report.py`、`tests/`、`demo.py` | 汇总执行结果、验证工作流行为并展示完整流程 |
 
-## 5. Planner 决策
+系统的核心设计原则是：**Agent 负责具体任务，Workflow Engine 负责流程控制，WorkflowState 负责共享数据，报告模块负责汇总结果。**
 
-TaskPlanner 使用可解释关键词规则，而不是额外调用 LLM：
+## 3. Agent 职责与协作机制
 
-| 任务意图 | CodeChecker | 理由 |
-| --- | --- | --- |
-| 全面审查、语法、错误、异常、安全、正确性、可靠性 | 调用 | AST 可发现确定性运行问题 |
-| 仅解释、总结、风格、命名、注释、文档、可读性 | 跳过 | 静态正确性检查与任务焦点无关 |
-| 同时包含风险与风格 | 调用 | 风险意图优先，避免漏检 |
-| 未知或模糊 | 调用 | 本地检查成本低，默认安全回退 |
+系统将复杂任务拆分为多个职责明确的 Agent。内置 Agent 通过统一接口接入 Workflow Engine，避免将所有逻辑集中在一个执行函数中。
 
-`ReviewPlan` 会传递给 Reviewer，并写入最终摘要，便于测试和审计。
+### 3.1 Coding Agent：代码生成
 
-## 6. CodeChecker
+主要文件：`coding_agent.py`
 
-CodeChecker 调用 `ast.parse()`，当前规则：
+主要职责：
 
-- `syntax-error`：捕获 `SyntaxError` 并转成 high 问题。
-- `bare-except`：查找 `ast.ExceptHandler.type is None`。
-- `division-by-zero`：检查 `/`、`//`、`%` 的右操作数是否为数字零常量，支持 `+0`、`-0.0`。
+- 接收用户需求和可选上下文。
+- 调用代码生成器生成 Python 源代码。
+- 验证生成结果的数据结构和基本语法。
+- 将生成代码及生成结果写入共享状态。
+- 将代码交给后续审查和测试节点。
 
-检查过程不导入、不编译、不执行被审查代码。规则输出包含 rule ID、行号、严重程度、原因和建议。
+核心接口包括：
 
-## 7. Reviewer 与 Mock 模式
+- `CodingAgent.execute(StateView) -> AgentResult`
+- `CodingAgent.generate(requirements, context=...)`
 
-`Reviewer` Protocol 隔离 Agent 与供应商实现。输入包括：
+代码生成结果使用 `CodeGenerationResult` 等结构化数据表示。代码通过 AST 语法解析并不代表业务逻辑一定正确，因此仍需要后续测试和审查。
 
-- 原始代码；
-- 用户任务；
-- Planner 决策；
-- CodeChecker 结果（如果调用）。
+### 3.2 Review Agent：代码审查
 
-`create_reviewer()` 根据 `.env` 自动路由：
+主要文件：`agent.py`、`review_policy.py`、`llm.py`
 
-- 缺少、为空或仍是占位 `DASHSCOPE_API_KEY`/`OPENAI_API_KEY`：`MockReviewer`；
-- 有效配置：`OpenAIReviewer`，通过千问 OpenAI 兼容接口工作。
+主要职责：
 
-配置优先读取 `DASHSCOPE_API_KEY`、`DASHSCOPE_BASE_URL`、`QWEN_MODEL`，并兼容旧的 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`。默认模型为 `qwen-plus`，默认地址为 `https://dashscope.aliyuncs.com/compatible-mode/v1`；生产环境可换成与 API Key 地域一致的工作空间专属地址。
+- 检查当前代码是否符合用户需求。
+- 综合代码检查结果、测试结果和相关上下文。
+- 识别明确的代码问题及阻断任务完成的问题。
+- 生成结构化的审查报告。
+- 为修复节点提供问题描述和必要证据。
 
-Mock 返回固定结构化结果，用于验证整个 Agent 流程。真实 Reviewer 调用 `chat.completions.create()`，设置 `response_format={"type": "json_object"}` 和非思考模式，然后读取 `choices[0].message.content`。`parse_review_report()` 先解析纯 JSON 或 JSON 代码围栏，再使用 Pydantic 严格校验 `ReviewReport`；空响应、截断、拒答、非法 JSON 和 schema 错误均转换为 `LLMReviewError`。Agent 始终直接合并本地 Tool 发现，因此 LLM 不会成为确定性结果的单点故障。
+审查报告使用 `ReviewReport`、`ReviewIssue` 等结构化模型。
 
-## 8. FileEditor 安全模型
+审查结果还会区分阻断问题与非阻断建议，避免将需求范围之外的改进建议直接当作必须完成的修复任务。
 
-自动修改需要显式 `--apply-fixes`，并只支持 `.py` 文件。
+系统保留 `CodeReviewAgent` 作为 `ReviewAgent` 的兼容名称，以支持原有调用方式。
 
-当前修复白名单：
+### 3.3 Test Agent：自动化测试
 
-- `bare-except`：`except:` → `except Exception:`。
+主要文件：`test_agent.py`、`test_feedback.py`
 
-拒绝自动修复：
+主要职责：
 
-- 语法错误：缺少足够上下文推断作者意图；
-- 常量除零：合法分母或业务分支未知；
-- 不在最终审查报告中的发现；
-- 行号或源码格式与预期不一致；
-- 审查后内容已变化的文件。
+- 读取当前代码和相关需求。
+- 通过测试生成器产生测试用例，或在复验阶段复用原有测试用例。
+- 在独立子进程中执行测试。
+- 汇总通过、失败、运行错误和超时等结果。
+- 将测试结果和失败证据写入共享状态。
 
-FileEditor 使用 `difflib.unified_diff` 生成可审计补丁。发生实际写入后，Agent 强制再次运行 CodeChecker。没有安全补丁时不写文件，也不会声称问题已解决。
+测试结果通过 `TestExecutionResult` 等结构化数据表示。
 
-## 9. 异常与退出码
+测试失败属于工作流需要处理的业务结果，并不必然意味着 Workflow Engine 自身执行失败。Engine 可以继续根据测试结果进行条件路由。
 
-| 场景 | 行为 |
-| --- | --- |
-| 空输入、文件不存在、错误扩展名 | 可读错误，退出码 2 |
-| `--apply-fixes` 未提供文件 | 拒绝修改，退出码 2 |
-| 文件在审查后变化 | 拒绝过期补丁，退出码 2 |
-| API 认证、限流、网络或状态错误 | 包装为 `LLMReviewError`，退出码 1 |
-| Ctrl+C | 退出码 130 |
-| 成功审查或无可自动修复项 | 退出码 0 |
+### 3.4 Fix Agent：自动修复
 
-## 10. Benchmark 设计
+主要文件：`fix_agent.py`
 
-`benchmarks/cases.py` 用字符串保存代码，因此可以安全包含无法编译的语法错误案例。每个 `BenchmarkCase` 定义：
+主要职责：
 
-- 稳定 ID；
-- 人类可读说明；
-- Python 代码字符串；
-- 有序的预期 rule ID。
+- 读取当前代码、审查报告和测试失败信息。
+- 根据问题证据生成修复后的代码。
+- 验证生成结果的结构和 Python 语法。
+- 记录修改前后的代码、差异及修复说明。
+- 将有效的修复结果提交给共享状态。
+- 在代码发生变化后触发重新测试和审查。
 
-Runner 对实际和预期序列做精确比较，打印每个任务的 PASS/FAIL，并在失败时返回退出码 1。当前包含 6 个问题案例和 1 个干净基线。
+修复 Agent 不以模型自行声称成功作为验收依据。修复是否有效，需要由后续测试和审查确认。
 
-## 11. 测试策略与结果
+### 3.5 Agent 统一接口
 
-测试均可离线执行，覆盖：
+`workflow/` 提供通用的 Agent 协作接口：
 
-- Mock/千问 OpenAI 兼容 Reviewer 路由；
-- Chat Completions 参数、纯 JSON、代码围栏 JSON、非法 JSON、schema 错误和截断响应；
-- Planner 调用、跳过、混合和模糊意图；
-- AST 语法、裸 `except`、三种零除及误报基线；
-- Agent 的 Tool 传递和报告合并；
-- FileEditor diff、实际写入、复检、危险修复跳过和过期补丁保护；
-- Benchmark 案例数量与所有预期。
-- Coding 节点的需求/上下文传递、生成代码到审查节点的数据衔接、State 版本与历史、失败不提交状态；
-- CodeGenerator 的配置选择、JSON/语法校验、截断/拒绝/空响应以及生成 CLI 的退出码。
-- TestGenerator 的结构化输出校验、配置选择，以及真实子进程的成功、断言失败、运行错误、全部跳过、超时、输出截断、环境隔离和 Workflow 状态提交。
-- Fix 反馈传递、服务和输出异常不提交代码、修复前结果保存、跳过无问题/无变化分支，以及原失败测试的实际复验。
-- 自动修复的多轮收敛、修复次数上限、无进展停止、异常轮次记录、快照独立性、重复运行预算重置，以及原有单轮接口兼容性。
+- `Agent` Protocol 定义 `name` 和 `execute(StateView) -> AgentResult`。
+- `BaseAgent` 为内置 Agent 提供统一的执行模板。
+- 内置 Agent 在 `run()` 中实现具体业务逻辑。
+- `AgentResult` 用于返回执行结果和状态变更。
+- `StateView` 为 Agent 提供只读的状态快照。
 
-2026-10-08 在 Python 3.14.3 / Windows 上：
+第三方 Agent 可以实现相同的 Protocol，而不必继承特定的基类。该设计降低了新增 Agent 时与既有实现之间的耦合。
 
-- `python -m unittest discover -s tests -v`：142 tests OK（包含原有 128 个测试，未修改原测试文件）；
-- `python -m benchmarks.run`：7/7 cases passed；
-- `python -m compileall -q .`：通过；
-- 源码 CLI 帮助：通过。当前虚拟环境没有 `pip`，本轮未重新验证安装和 console scripts；真实 LLM 仅使用模拟响应验证。
+## 4. Workflow 编排与执行流程
 
-GitHub Actions 会在 Python 3.10、3.12 上重复编译、离线测试和 Benchmark。远程结果需在仓库首次 push 后确认。
+### 4.1 基本执行流程
 
-## 12. 扩展点
+完整的工作流包含以下阶段：
 
-- 在 `CodeChecker` 中增加更多 AST Visitor 规则。
-- 用配置文件或分类器替换 Planner 关键词，但保持 `ReviewPlan` 接口。
-- 新增其他 LLM 供应商，只需实现 `Reviewer` Protocol。
-- 为 FileEditor 增加带规则 ID 的白名单修复器，避免自由文本直接驱动写入。
-- 扩展 Benchmark 到性能、安全和误报/漏报数据集。
-- 接入 Ruff、Bandit 或 mypy，并将结果标准化为 `CodeCheckFinding`。
-
-## 13. Workflow 框架
-
-### Review 的任务范围与评分
-
-`ReviewAgent.run()` 将当前需求、背景、测试结果和原用例组织为 `ReviewContext`，公共 `execute()` 由 `BaseAgent` 提供。`OpenAIReviewer.review_with_context()` 将该上下文加入模型输入；对未声明此扩展的旧 Reviewer，保留原调用签名。默认审查任务收敛为需求一致性、已有测试失败和明确代码问题。
-
-`ReviewIssue` 增加 `category`、`scope`、`evidence`、`requirement_ref`，兼容旧字段；`ReviewReport` 增加非阻断 `recommendations`、Agent 计算的 `score` 与审查时的 `test_status`。`review_policy.py` 保留全部工具发现，将 improvement、out_of_scope 和未明确要求的安全标准转为建议。标准需要引用用户 requirements 或自定义 task 的对应要求；泛泛的密码引用与明确排除的规范不会授权新增任务范围。
-
-需求、实际测试失败和明确要求的安全标准每项扣 40 分；明确代码缺陷按 critical/high/medium/low 扣 40/25/15/5 分，从 100 起计算且不低于 0。可选建议不扣分，实际测试失败即使被模型漏报也由 Agent 补成阻断项；未执行测试显示 not_run，不虚构通过或失败。
-
-Workflow 的 `_resolved()` 仍检查实际阻断问题为空和测试通过，不以分数阈值替代验收。Fix 提示明确只处理 `report.issues` 与测试失败，不将 `report.recommendations` 当作扩展功能的依据；具体漏洞与代码缺陷不会因为测试通过而被豁免。仅有需求外标准建议且测试通过的流程可在 0 次修复后结束。
-
-`workflow/` 将可复用的流程能力与代码审查领域逻辑分离：
-
-- `Agent` Protocol 只要求 `name` 和 `execute(StateView) -> AgentResult`，第三方 Agent 无需继承基类。内置 `CodingAgent`、`ReviewAgent`、`FixAgent`、`TestAgent` 统一继承 `BaseAgent`：基类固定公共 `execute()` 模板，校验输入快照及返回契约，再调用子类的抽象 `run()`；`CodeReviewAgent` 作为 `ReviewAgent` 的兼容名称保留。
-- `WorkflowState` 统一保存跨步骤数据、运行状态、当前步骤、错误和版本号，并以独立运行元数据保存阶段状态/历史、Agent 结果、测试结果历史、修复历史入口、迭代次数和结构化执行日志。Agent 只能读取 `StateView` 快照，通过 `AgentResult.updates` 返回变更，由 Engine 在步骤成功后一次性提交并生成 `StateChange` 记录；运行元数据不改变业务版本号。
-- `WorkflowEngine` 支持固定 `next_step`、Agent 返回的动态 `next_step` 和基于提交后状态的 `router`。路由优先级依次为 Agent 决策、router、固定后继。
-- `max_steps` 为循环流程提供硬上限；Agent 或 router 异常会包装为携带失败状态的 `WorkflowExecutionError`。
-- `ReviewAgent` 保留原有 `review`、`review_detailed`、`review_and_fix` 接口，同时通过 `BaseAgent` 实现统一接口；`CodeReviewAgent` 兼容现有调用。`create_review_workflow()` 提供默认的一步审查流程，调用方可继续追加步骤。
-
-## 14. Coding Agent
-
-`coding_agent.py` 提供 `CodingAgent(BaseAgent)`，接口为 `execute(StateView) -> AgentResult`，也支持直接调用 `generate(requirements, context=...)`。代码生成与审查共用已有 LLM 配置，供应商实现通过 `CodeGenerator` Protocol 隔离。
-
-数据流如下：
+1. 初始化共享状态和运行元数据。
+2. 执行 Coding Agent，生成初始代码。
+3. 执行 Review Agent，检查需求一致性和代码问题。
+4. 执行 Test Agent，验证代码行为。
+5. 根据审查结果、测试结果和修复预算选择后续节点。
+6. 如果需要修复，则执行 Fix Agent。
+7. 代码发生变化后，重新执行测试和审查。
+8. 根据最终结果、预算和异常情况结束工作流。
+9. 生成最终执行报告。
 
 ```mermaid
-flowchart LR
-    Input[State: requirements + context] --> Coding[CodingAgent]
-    Coding --> Provider[CodeGenerator]
-    Provider --> Validate[JSON schema + Python AST 校验]
-    Validate --> Commit[State: code + generation_result]
-    Commit --> Review[ReviewAgent]
-    Review --> Report[State: report + review_run]
+flowchart TD
+    Start([开始]) --> Init[初始化 WorkflowState]
+    Init --> Coding[Coding Agent]
+    Coding --> Review[Review Agent]
+    Review --> Test[Test Agent]
+    Test --> Check{审查与测试均通过?}
+
+    Check -->|是| Success[任务解决]
+    Check -->|否| Budget{仍有修复预算?}
+    Budget -->|是| Fix[Fix Agent]
+    Fix --> Changed{代码发生变化?}
+    Changed -->|是| Retest[Test Agent 复测]
+    Retest --> ReReview[Review Agent 复审]
+    ReReview --> Check
+    Changed -->|否| NoProgress[停止：无进展]
+    Budget -->|否| Limit[停止：达到修复上限]
+
+    Success --> Report[生成执行报告]
+    NoProgress --> Report
+    Limit --> Report
+    Report --> End([结束])
 ```
 
-- `requirements` 必须是非空字符串，`context` 可选且必须为字符串。输入校验失败时不调用生成服务。
-- `CodeGenerationResult` 要求 `code` 和 `summary` 两个字段；源代码必须非空且可通过 AST 解析，不接受只有注释的输出。AST 校验不执行代码，也不能证明业务正确性。
-- `OpenAICodeGenerator` 使用已有 Chat Completions 请求形态，解析 JSON 并封装认证、限流、连接及输出校验错误为 `LLMGenerationError`。
-- `MockCodeGenerator` 生成保存需求的固定形式示例，用于离线验证；输出说明明确标注未实现用户的业务功能。
-- Coding 的状态更新仅包含 `code` 和 `generation_result`，由 Engine 统一提交与记录版本。生成失败不会覆盖旧代码，Engine 保留失败步骤和原因。
-- `create_coding_workflow(coding_agent, review_agent=None, test_agent=None, fix_agent=None, max_fix_attempts=None)` 支持可选的 Review、Test 和 Fix 节点；指定修复次数参数时启用自动循环，最终输出属于最后实际执行的节点。
-- CLI `--requirements` 与 `--context` 默认调用生成/审查两节点流程；`--run-tests` 启用 Test 节点并实际执行生成代码。
+### 4.2 Workflow Engine
 
-## 15. Test Agent
+主要实现位于 `workflow/`。
 
-`TestAgent(BaseAgent)` 读取 State 中的 `code` 及可选 `requirements`、`context`，通过 `TestGenerator` 生成用例，再交给 `TestRunner` 执行。TestGenerator 使用现有 Qwen 配置；无有效 Key 时选择仅验证模块导入的 Mock。
+`WorkflowEngine` 负责：
 
-```mermaid
-flowchart LR
-    Coding[CodingAgent] --> Code[State: code]
-    Code --> Test[TestAgent]
-    Test --> Generate[TestGenerator]
-    Generate --> Validate[TestGenerationResult 校验]
-    Validate --> Run[TestRunner + test_worker 子进程]
-    Run --> Commit[State: test_cases + test_result]
+- 按照配置执行工作流节点。
+- 为 Agent 提供当前状态的只读快照。
+- 校验 Agent 返回的结果。
+- 在节点成功执行后统一提交状态变更。
+- 选择下一个执行节点。
+- 记录阶段状态、Agent 执行记录和路由事件。
+- 在出现异常时保留失败状态并提供异常信息。
+
+Engine 支持以下路由方式：
+
+1. 固定后继节点 `next_step`。
+2. Agent 返回的动态 `next_step`。
+3. 根据状态计算下一节点的 `router`。
+
+路由优先级为 Agent 返回的动态决策、Router 决策、固定后继节点。
+
+这种设计同时支持简单顺序工作流和包含条件分支、循环的复杂工作流。
+
+### 4.3 单轮工作流与自动修复工作流
+
+项目保留不同复杂度的工作流入口：
+
+- `create_review_workflow()`：创建以代码审查为核心的基础工作流。
+- `create_coding_workflow()`：将编码与可选的审查、测试、修复节点组合起来。
+- `create_test_workflow()`：创建已有代码的测试工作流。
+- `create_fix_workflow()`：创建单节点修复工作流。
+- `create_repair_workflow()`：创建带修复预算和多轮反馈的自动修复工作流。
+
+单轮修复和自动修复循环是不同的执行模式。单轮模式完成一次修复和配置好的复验；自动循环模式则需要完整的 Review、Fix、Test 节点来持续验证结果。
+
+## 5. 状态共享与数据传递
+
+### 5.1 WorkflowState
+
+`WorkflowState` 是跨 Agent 的统一状态载体，保存工作流执行所需的共享数据。
+
+主要数据包括：
+
+- 当前源代码 `code`。
+- 初始代码生成结果 `generation_result`。
+- 当前审查报告 `report`。
+- 测试用例 `test_cases`。
+- 测试结果 `test_result`。
+- 修复结果 `fix_result`。
+- 当前步骤和工作流生命周期状态。
+- 状态版本号及错误信息。
+- 修复历史和执行过程相关数据。
+
+实际字段以项目中的状态模型为准。
+
+### 5.2 StateView：只读状态快照
+
+Agent 不直接任意修改共享状态，而是通过 `StateView` 读取执行时的状态快照。
+
+这种设计有两个目的：
+
+1. 避免某个 Agent 在执行过程中意外修改其他 Agent 正在使用的数据。
+2. 使每次状态变更都能通过统一入口提交和记录。
+
+### 5.3 AgentResult 与原子提交
+
+Agent 完成任务后，通过 `AgentResult.updates` 返回希望提交的状态变更。
+
+Workflow Engine 在节点成功执行后统一提交这些变更，并记录对应的 `StateChange`。
+
+状态提交具有以下特点：
+
+- 成功的状态更新集中处理。
+- Agent 执行失败时，不提交该次尚未成功完成的状态更新。
+- 状态版本号用于追踪业务状态变化。
+- 运行元数据与业务状态版本分开管理。
+
+例如，Coding Agent 成功后将生成代码写入 `code`；Test Agent 成功执行后提交测试结果；Fix Agent 只有在输出通过校验后才提交新的代码。
+
+### 5.4 修复前后状态的保留
+
+为避免新结果覆盖重要证据，修复流程会保留必要的修复前状态，例如：
+
+- `report_before_fix`
+- `review_run_before_fix`
+- `test_result_before_fix`
+- `code_before_fix`
+
+当代码发生变化时，当前审查和测试诊断会在适当时机清空或更新，以便后续节点使用最新代码进行验证。
+
+如果存在原测试用例，修复后的复验会尽量复用这些用例，而不是重新生成一套不同的测试来代替原有验收标准。
+
+## 6. 条件分支、修复循环与终止机制
+
+### 6.1 条件分支
+
+工作流根据 Review 和 Test 的独立结果进行路由。
+
+| 当前情况 | 后续动作 |
+|---|---|
+| 尚未完成基线验证 | 执行测试 |
+| 测试失败或存在阻断问题 | 进入修复流程 |
+| 修复后代码发生变化 | 重新测试并复审 |
+| 测试通过但尚未完成审查 | 继续审查 |
+| 审查无阻断问题且测试通过 | 结束并标记任务已解决 |
+| 修复后没有代码变化 | 停止继续修复 |
+| 修复预算耗尽 | 结束修复循环并保留最终结果 |
+
+系统不会仅凭审查分数决定任务是否完成，而是检查实际阻断问题和测试结果。
+
+### 6.2 自动修复循环
+
+`workflow/repair.py` 提供 `RepairWorkflowEngine` 和 `create_repair_workflow()`。
+
+默认最大修复次数为 3，可以通过 `max_fix_attempts` 配置。设置为 0 时，只进行诊断和基线验证，不执行自动修复。
+
+每轮循环主要经过以下阶段：
+
+```text
+Review → Fix → Test → Review
 ```
 
-- `TestCase` 包含唯一的 `test_` 名称及非空 unittest 方法体。执行器提供 `self`、`module` 和 `unittest`；真实生成提示要求正常、边界和异常用例。
-- Test 节点再次验证供应商输出，再一次性提交 `test_cases`、`test_result` 和 `test_generation_result`。生成失败或执行器异常不覆盖旧结果。
-- `test_feedback.py` 在 Test 提交前给失败和运行错误补充原测试名、方法体及字符串期望；结果同时保存按用例名组织的 `test_expectations`。提取器静态分析字面量和明确的局部常量，不运行测试表达式；精确、正则和子串断言保持区分，无法提取时仍传递原源码。
-- State 中 `reuse_test_cases=True` 时，Test 节点校验并复跑已有测试，不调用 TestGenerator；该标记在复验提交后恢复为 False。
-- 执行器在临时目录中保存被测代码和组装后的 `GeneratedTests`，启动当前解释器 `-I -B -X utf8` 运行仅依赖标准库的 `test_worker.py`。环境只保留 Windows 系统路径变量及临时目录变量，不继承 API Key。
-- 默认超时 10 秒。超时后终止测试进程，在 Windows 使用 taskkill 清理进程树，在 POSIX 终止进程组；stdout/stderr 写入临时日志，返回结果每项最多保留 64 KiB。
-- worker 通过 unittest 的实际计数和 traceback 构建结果，不解析日志判断成功。进程提前退出、结果缺失、数量不一致或全部跳过均不会报告通过。
-- `test_result.status` 区分 `passed`、`failed`、`error`、`timeout`；包含计数、失败和错误详情、stdout/stderr、耗时与退出码。测试失败或超时是业务结果，Workflow 可正常完成并让后续 router 处理；生成或基础设施异常由 Engine 标记为 `FAILED`。
-- `create_test_workflow()` 提供已有代码的单节点入口；Coding Workflow 支持 `coding -> test` 和 `coding -> review -> test`。
-- CLI `--run-tests` 启用三节点流程，`--test-timeout` 设置时间上限；测试非通过状态返回退出码 1。
+每轮修复都使用当前代码、最新审查结果和测试失败证据。修复后必须通过复验，才能认定问题已经解决。
 
-独立子进程并非操作系统安全沙箱。被测代码和生成用例仍具有当前用户的文件及网络访问权限；临时工作目录、精简环境和超时不构成权限隔离。
+### 6.3 终止条件
 
-## 16. Fix Agent
+自动修复循环主要包含以下终止条件：
 
-`FixAgent(BaseAgent)` 读取当前 `code`、Review 的 `report`、Test 的 `test_result` 和可选的 `test_cases`、`requirements`、`context`。至少需要一份当前诊断结果。`CodeFixer` Protocol 隔离供应商；真实实现使用已有 Qwen 配置，返回与 Coding 相同的 `CodeGenerationResult`，由 Fix 节点再次执行结构和 AST 校验。
+- **resolved：** 审查没有阻断问题，且测试通过并存在实际通过的测试。
+- **max_fix_attempts：** 已达到最大修复次数，问题仍未解决。
+- **no_change：** 修复结果与当前代码没有实际差异。
+- **error：** Agent 或基础设施发生异常，导致工作流无法继续。
 
-```mermaid
-flowchart LR
-    Review[Review: report] --> Fix[FixAgent]
-    Test[Test: test_result + test_cases] --> Fix
-    Fix --> Provider[CodeFixer]
-    Provider --> Validate[结构与 Python AST 校验]
-    Validate --> Commit[State: code + fixed_code + fix_result]
-    Commit --> Changed{代码变更?}
-    Changed -->|是| ReReview[verify_review]
-    ReReview --> ReTest[verify_test: 原用例]
-    Changed -->|否| End[END]
+修复预算统计实际进入 Fix 阶段的次数，不将普通 Review 或 Test 调用计入修复次数。
+
+预算耗尽和无进展可以是正常的工作流终止情况，但不意味着业务任务成功。调用方需要结合 `repair_succeeded`、最终审查报告和测试结果判断任务是否解决。
+
+### 6.4 Fix Agent 内部语法重试
+
+Fix Agent 还包含与工作流循环不同的内部语法重试机制。
+
+当生成代码未通过语法或编译校验时，可以在同一次 Fix 节点执行中补充错误信息并重新生成。默认首次生成失败后最多再尝试 3 次，即最多进行 4 次代码生成调用。
+
+内部语法重试与外部修复循环的区别：
+
+- 内部重试处理的是同一次修复任务中的生成输出问题。
+- 外部修复循环处理的是修复后代码是否通过测试和审查。
+- 内部重试不会增加 Workflow 修复轮数。
+- 最终输出只有通过相应校验后才会提交状态。
+
+## 7. 工具、模型与代码安全
+
+### 7.1 CodeChecker
+
+`code_checker.py` 提供基于 Python AST 的本地静态检查。
+
+当前规则包括：
+
+- `syntax-error`：捕获 Python 语法错误。
+- `bare-except`：检查未指定异常类型的 `except:`。
+- `division-by-zero`：检查除法、整除和取模操作中的常量零分母。
+
+CodeChecker 不导入或执行被审查代码。当前规则集较小，不能替代完整的静态分析工具。
+
+### 7.2 Reviewer 与代码生成供应商
+
+`llm.py` 等模块负责隔离模型调用和结构化输出解析。
+
+项目通过 Protocol 将 Agent 与具体供应商实现分离，并支持 Mock 模式，以便在没有有效 API Key 的情况下验证主要流程。
+
+真实模型输出仍需要进行结构校验和必要的语法验证。符合数据结构要求不代表生成内容一定正确，因此最终验收依赖实际审查和测试结果。
+
+### 7.3 FileEditor
+
+`file_editor.py` 提供受限制的补丁生成和应用能力。
+
+旧代码审查入口只有在显式指定 `--apply-fixes` 时才会尝试写入文件。当前白名单修复包括将裸 `except:` 修改为 `except Exception:`。
+
+对于无法安全推断修复方式、源码位置不匹配或文件在审查后发生变化的情况，系统会拒绝应用补丁。
+
+生成代码的 Fix Agent 与直接修改本地文件的 FileEditor 属于不同路径，不能将二者视为同一种操作。
+
+### 7.4 测试执行隔离
+
+Test Agent 使用独立子进程运行生成的测试，并提供超时控制和输出限制。
+
+这种方式能够限制测试进程对主工作流的影响，但不是完整的操作系统安全沙箱。被测代码仍可能拥有当前用户的文件和网络访问权限，因此不应将该机制描述为能够安全执行任意不可信代码。
+
+## 8. 执行日志与 Workflow Report
+
+### 8.1 执行日志
+
+工作流会记录阶段启动、Agent 完成、状态更新、路由选择和工作流结束等事件。
+
+日志用于：
+
+- 还原 Agent 的执行顺序。
+- 检查条件分支是否按预期选择。
+- 追踪状态版本变化。
+- 定位修复失败或异常发生的位置。
+- 统计各阶段执行次数和耗时。
+
+自动修复工作流还会记录每轮修复对应的阶段执行信息，使不同轮次的结果可以分别查看。
+
+### 8.2 最终报告
+
+`workflow/report.py` 根据终态 `WorkflowState` 生成不可变的 `WorkflowReport`。
+
+报告包含：
+
+- 工作流最终状态和业务结果。
+- 各阶段的最终状态、执行次数、耗时和错误。
+- Agent 执行记录。
+- 测试历史。
+- 修复轮次及相关记录。
+- 结构化执行日志。
+
+报告通过 `WorkflowOutcome` 区分引擎执行状态与任务验收结果：
+
+- `succeeded`：工作流正常完成，任务验收条件满足。
+- `unresolved`：工作流完成，但任务仍存在未解决问题。
+- `failed`：执行过程中出现导致工作流失败的异常。
+
+正常执行可以通过 `WorkflowRun.report` 获取报告；异常执行可以根据异常携带的状态生成报告。
+
+## 9. 异常处理与错误恢复
+
+系统将业务失败与执行异常区分处理。
+
+### 9.1 业务失败
+
+例如测试断言失败、审查发现问题、修复没有改变代码等。
+
+这些结果会被记录在共享状态中，供 Router 决定是否继续修复或结束流程。
+
+### 9.2 执行异常
+
+例如模型调用失败、返回数据无效、测试执行器异常或 Router 抛出异常。
+
+Workflow Engine 会保留可用的失败状态，并通过 `WorkflowExecutionError` 等异常机制暴露失败原因。
+
+### 9.3 状态保护
+
+系统尽可能避免无效结果覆盖已有的有效代码和诊断信息。
+
+修复输出在通过必要的结构和语法校验之前不会作为成功的代码变更提交。修复后的代码还必须通过后续测试和审查，才能确认任务已经解决。
+
+## 10. 项目结构
+
+```text
+intelligent-agent-workflow/
+├── workflow/              # Workflow Engine、状态、路由、修复循环和报告
+├── tests/                 # 自动化测试
+├── benchmarks/            # 基准案例与回归验证
+├── agent.py               # 代码审查 Agent
+├── coding_agent.py        # 代码生成 Agent
+├── test_agent.py          # 测试 Agent
+├── fix_agent.py           # 代码修复 Agent
+├── code_checker.py        # AST 静态检查
+├── file_editor.py         # 安全补丁生成与应用
+├── planner.py             # 审查任务规划
+├── llm.py                 # 模型接口与 Reviewer 实现
+├── prompt.py              # 模型提示词
+├── models.py              # 结构化数据模型
+├── review_policy.py       # 审查问题策略
+├── demo.py                # 完整工作流演示
+├── main.py                # 命令行入口
+├── requirements.txt       # Python 依赖
+├── pyproject.toml         # 项目配置
+├── README.md              # 项目说明
+└── Design.md              # 设计文档
 ```
 
-- 没有审查问题且测试通过时不调用修复服务。测试失败、运行错误和超时均视为可处理反馈；修复提示要求遵守原需求、不修改测试、不绕过断言。
-- `FixRun` 保存原代码、输出代码、说明、unified diff、`changed` 和 `skipped`。这些字段由 Agent 根据实际输出计算，模型不能自行宣称已修改或已通过测试。
-- Agent 成功后原子提交 `code`、`fixed_code`、`code_before_fix`、`fix_result`、`fix_changed`。API 错误或输出无效不改变原代码和诊断。
-- 代码变更时保存 `report_before_fix`、`review_run_before_fix`、`test_result_before_fix`，并清空当前诊断。原有测试用例保持不变，存在原用例时设置 `reuse_test_cases=True`。
-- Coding Workflow 的原有单轮模式至少要有一个反馈节点。变更后的代码由已配置的 Review/Test 节点执行一次复验；没有变更则直接结束。启用自动循环需要全部 Review/Fix/Test 节点，详见下一节。
-- `create_fix_workflow()` 是单节点入口，更新 State 后由调用方决定后续复验。`generation_result` 保留初始 Coding 产物，当前源代码应从 `code` 读取。
-- Mock Fixer 复用 `FileEditor.generate_patch()`，只生成白名单式裸 `except` 修改，不调用写文件接口。真实 Fixer 返回完整代码，修复是否有效由复验确认。
-- Fix 请求额外提供 `test_contract` 和 `failed_test_contexts`，保留原测试的期望文案，即使调用方只有已保存的失败结果。修复提示要求保留消息原文，识别正向/否定及精确/正则/子串语义；密码校验顺序明确为基础类型/空值、弱密码、长度/复杂度，禁止用复杂度错误覆盖弱密码提示。
-- register_user 的复杂度约束为 `has_special and other_categories >= 2`，其中另两类从大写、小写、数字中计数，空白不作为特殊字符。最小长度 8 和原错误文案保持不变；Test Agent 实际执行的 12 个组合覆盖了边界条件。
-- CLI `--fix-code` 默认启用单轮修复和复验；增加 `--max-fix-attempts` 与 `--run-tests` 可启用自动循环。结果写入 State 并打印，与已有文件写入 `--apply-fixes` 分开。
+## 11. 运行方法
 
-### Fix 内部语法重试
+### 11.1 环境准备
 
-`GeneratedCodeSyntaxError` 标记模型校验中的 Python 语法失败，Pydantic 的结构化诊断保留该类型和错误草稿。解析层传递 `LLMCodeSyntaxError`，修复供应商转换成 `LLMFixSyntaxError`，使 Fix Agent 可与普通服务/格式错误区分。注入的供应商返回无效模型或直接抛出对应 ValidationError 时也使用相同分类。
+建议使用 Python 虚拟环境，并按照项目依赖文件安装所需依赖。
 
-Fix Agent 默认在首次生成失败后最多再试 3 次，共最多 4 次代码生成调用。每次在原 context 后补充上次语法错误和无效草稿，原代码、需求、Review/Test 反馈保持一致。AST 校验之后还执行 `compile(..., 'exec')`，识别函数外 return 等 AST 可解析但不可编译的代码，校验不执行源代码。
-
-重试属于同一次 Fix 节点执行；只有最终有效代码生成 diff 并一次性提交 State，所有调用耗时计入该节点。Workflow 的步骤顺序、State 更新次数和修复轮数不因内部重试增加。成功的 `FixRun` 记录 `generation_attempts` 与 `syntax_errors`；无问题跳过时生成次数为 0。重试耗尽保留原代码和诊断，通过原异常机制标记失败，非语法的服务/JSON/schema 错误立即按原机制报错。
-
-## 17. 自动修复循环
-
-`workflow/repair.py` 提供 `RepairWorkflowEngine(WorkflowEngine)` 和 `create_repair_workflow()`。底层仍使用现有 Engine 的步骤执行、路由、State 原子提交和异常封装；阶段包装器将预算与轮次记录合并进对应 Agent 的状态更新。原单轮工厂的默认参数、步骤顺序和版本计数保持兼容。
-
-```mermaid
-flowchart LR
-    Baseline[Review + Test 基线] --> Decision{审查和测试均通过?}
-    Decision -->|是| Done[resolved]
-    Decision -->|否| Budget{仍有修复预算?}
-    Budget -->|否| Limit[max_fix_attempts]
-    Budget -->|是| Fix[Fix]
-    Fix --> Changed{代码变更?}
-    Changed -->|否| Stop[no_change]
-    Changed -->|是| Test[复用原用例 Test]
-    Test --> Review[Review]
-    Review --> Decision
+```bash
+python -m venv .venv
 ```
 
-- `max_fix_attempts` 默认 3，允许非负整数，0 表示仅诊断。`fix_attempts` 统计实际进入 Fix 阶段的次数，包括无变化和异常的尝试；Review/Test 次数不占修复预算。
-- 初次 Review/Test 形成基线反馈，后续按 `Review -> Fix -> Test -> Review` 迭代。新 Fix 读取当前代码与上轮最新的审查和测试结果；原测试用例始终复用。
-- 成功要求 Review 无问题、Test 为 `passed` 且存在实际通过的测试；最后一次允许的修复若通过，优先标记 `resolved`。未通过且次数用完为 `max_fix_attempts`，没有代码变化为 `no_change`。
-- 每个阶段生成 `RepairDecision`，以 Review/Test 的独立通过状态、预算、代码是否变化为条件选择 `test`、`review`、`fix` 或 `END`；决策原因随 State 保存并写入 `repair.decision` 执行日志。
-- `repair_history` 是按尝试顺序保存的 `RepairRound` 元组，包括原代码、输出代码、修复前后诊断快照、修复输出/diff、状态与 `RepairStepExecution`。步骤记录 Agent、State 版本、耗时、输出和错误；后续阶段不会修改早先记录。
-- 顶层 `StageState`、`AgentResultRecord` 和 `ExecutionLog` 使用 `repair_round` 关联基线（0）及每次修复（从 1 开始），`logs_for_round()` 可直接还原单轮 Agent、状态提交、路由和终止判断。
-- `active_repair_round` 保存 Fix 之后尚未完成复验的轮次。阶段异常时，Engine 保留原异常链，追加包含部分步骤和错误的轮次，标记 `repair_stop_reason=error` 和 `repair_succeeded=False`，同时保留之前完成的记录。
-- 每次 `run()` 初始化独立计数和历史，不采用初始 State 传入的计数来控制预算。同一 Engine 可执行多个独立 State，终态 State 仍不能重新启动。
-- 预算耗尽或无进展是正常结束条件，Workflow 为 `COMPLETED`；Agent 异常为 `FAILED`。调用方用 `repair_succeeded` 判断任务是否解决，而非只看生命周期状态。
-- 循环的 `max_steps` 按修复预算设置足够的容量，同时保留通用步骤上限，避免较大预算被原默认 100 步提前截断。
-- Coding Workflow 通过 `max_fix_attempts` 参数接入循环；CLI 通过 `--max-fix-attempts N` 接入并显示每轮记录。循环未解决问题时返回退出码 1，即使测试通过但审查仍有问题。
+Windows 下激活虚拟环境：
 
-## 18. Workflow Report
+```cmd
+.venv\Scripts\activate
+```
 
-`workflow/report.py` 从终态 `WorkflowState` 生成不可变的 `WorkflowReport`。正常执行通过 `WorkflowRun.report` 访问，异常执行通过 `generate_workflow_report(error.state)` 访问；运行中的 State 被拒绝，避免把中间快照误标为最终结论。
+安装依赖：
 
-报告同时保留聚合视图和原始证据：`StageReport` 汇总每个阶段的最终状态、调用次数、耗时和错误，原始 `StageState`、`AgentResultRecord`、测试历史、`RepairRound` 与 `ExecutionLog` 仍按顺序保存。`WorkflowOutcome` 将执行状态与业务验收分离：引擎异常为 `failed`，Review/Test 或修复结论未通过为 `unresolved`，其余完成态为 `succeeded`。`to_dict()` 递归处理 dataclass、Enum、UTC 时间、Pydantic 模型和只读映射，输出 JSON 兼容结构。
+```bash
+pip install -r requirements.txt
+```
 
-## 19. 已知限制
+部分真实模型调用功能需要有效的模型服务配置。Mock 模式可用于离线验证支持的流程。
 
-- 规则集刻意保持最小，不能替代生产级静态分析器。
-- Planner 依赖关键词，无法理解复杂隐含意图。
-- Mock 输出固定，不评估输入代码的高层语义。
-- FileEditor 不根据自由文本建议任意生成代码，这是为了控制自动写入风险。
-- 真实 LLM 输出即使符合 schema，也仍可能存在判断错误。
-- 当前 Workflow Engine 是进程内同步执行器，不提供持久化、分布式调度或断点恢复。
-- Coding Agent 当前输出单份 Python 源代码，不生成多文件工程；运行由可选 Test 节点负责，需求完成程度依赖模型和测试覆盖范围。
-- Test Agent 不自动安装生成代码的第三方依赖；依赖需已存在于执行解释器环境中，Mock 仅验证导入而非业务功能。
-- Fix 当前只处理单份 Python 源代码；单轮模式和有次数上限的循环均不能保证问题解决，应检查最终报告、测试状态和 `repair_succeeded`。
-- register_user 回归使用模拟模型响应与真实测试子进程，验证两轮修复后原有 10 个注册用例通过；不声称未保存的历史 Demo 或真实模型调用已通过。
+### 11.2 运行完整工作流演示
+
+```bash
+python demo.py
+```
+
+该演示展示代码生成、审查、测试、条件路由、迭代修复、执行日志和最终报告。
+
+### 11.3 运行自动化测试
+
+```bash
+python -m pytest -v
+```
+
+测试覆盖 Agent 行为、共享状态、条件路由、失败反馈、自动修复循环和报告生成等关键功能。
+
+## 12. 测试与演示结果
+
+### 12.1 自动化测试
+
+本项目已执行以下测试命令：
+
+```bash
+python -m pytest -v
+```
+
+已验证结果：
+
+- 145 项测试通过。
+- 118 个子测试通过。
+- 共 39 条 Pytest 警告。
+- 本次测试未报告失败或错误。
+
+警告主要涉及部分带有构造函数的 `Test*` 类被 Pytest 提示无法作为测试类自动收集，不影响本次通过结果。
+
+### 12.2 端到端演示
+
+`demo.py` 使用存在缺陷的 `add(a, b)` 函数展示工作流的完整执行过程。
+
+已验证的演示结果：
+
+- 工作流执行成功。
+- 共执行 9 个阶段。
+- 完成 2 轮代码修复。
+- 记录 56 条工作流日志。
+- 最终审查评分为 100，阻断问题数量为 0。
+- 最终测试 3/3 项通过。
+- 最终代码为：
+
+```python
+def add(a, b):
+    return a + b
+```
+
+该演示用于展示 Workflow 的编排、状态更新、条件分支和修复循环。演示结果不应被理解为真实模型在所有代码任务中都能保证修复成功。
+
+## 13. 可扩展性设计
+
+项目将通用流程能力与代码审查业务逻辑分离，因此可以在现有结构上逐步扩展。
+
+### 13.1 增加 Agent
+
+新增 Agent 可以实现 `Agent` Protocol，并通过 `AgentResult` 返回结果。只要遵守共享状态和返回契约，就可以接入现有 Workflow Engine。
+
+### 13.2 增加流程节点
+
+可以为工作流添加新的 Review、Test 或 Fix 阶段，或者通过 Router 调整执行顺序和条件分支。
+
+### 13.3 扩展静态检查规则
+
+可以在 CodeChecker 中增加 AST 规则，或者接入 Ruff、Bandit、mypy 等外部检查工具，再将结果转换为统一的数据结构。
+
+### 13.4 扩展模型供应商
+
+通过实现对应的 Protocol，可以替换代码生成、审查或修复的供应商，而不需要重写 Workflow Engine。
+
+### 13.5 扩展执行能力
+
+未来可以进一步加入持久化状态、断点恢复、并行执行、可视化流程界面和更细粒度的执行权限控制。
+
+这些属于后续扩展方向，不代表当前版本已经实现。
+
+## 14. 已知限制
+
+1. 当前 Workflow Engine 采用进程内同步执行，不提供分布式调度、持久化状态或断点恢复。
+2. 当前代码生成与修复以单份 Python 源代码为主，不直接生成完整的多文件工程。
+3. AST 检查规则集较小，无法覆盖所有语法、运行时和业务逻辑问题。
+4. Mock 模式主要用于验证流程和接口，不代表真实模型的语义理解能力。
+5. 真实模型输出仍可能存在错误；语法校验不能保证业务正确性。
+6. Test Agent 不自动安装生成代码所需的第三方依赖，相关依赖需要在执行环境中准备好。
+7. 测试子进程不是完整安全沙箱，不能用于无条件执行不可信代码。
+8. 自动修复有次数限制，也可能因无进展或异常提前终止，不能保证所有任务都能修复成功。
+9. 自动化测试通过说明已覆盖的测试行为符合预期，不等于所有可能输入和生产环境都不存在问题。
+
+## 15. 总结
+
+本项目以代码生成、审查、测试和修复为业务场景，构建了一个具备共享状态、统一 Agent 接口、顺序编排、条件分支、有限循环、错误处理和执行报告能力的多 Agent Workflow。
+
+项目不仅展示了多个 Agent 如何协作完成一个端到端任务，也将通用流程控制与具体业务逻辑分离，为后续添加新 Agent、扩展节点类型和完善工作流执行能力提供了基础。
