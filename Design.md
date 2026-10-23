@@ -21,29 +21,33 @@
 
 ```mermaid
 flowchart TD
-    User[用户需求与任务]
-    User --> Coding[Coding Agent]
-    Coding --> Review[Review Agent]
-    Review --> Test[Test Agent]
-    Test --> Decision{测试与审查结果}
-    Decision -->|发现问题| Fix[Fix Agent]
-    Fix --> Test
-    Decision -->|全部通过| Report[Workflow Report]
-    Decision -->|达到修复上限或无进展| Report
+    User[用户需求与任务] --> Coding[Coding Agent]
+    Coding --> Review[基线 Review]
+    Review --> Test[基线 Test]
+    Test --> Decision{审查与测试结果}
+    Decision -->|均通过| Report[Workflow Report]
+    Decision -->|需修复且有预算| Fix[Fix Agent]
+    Decision -->|预算耗尽| Report
+    Fix --> Changed{代码有变化?}
+    Changed -->|否：no_change| Report
+    Changed -->|是| Retest[Test 复测]
+    Retest --> ReReview[Review 复审]
+    ReReview --> Decision
 
     State[(WorkflowState)]
-    Coding -.读写状态.-> State
-    Review -.读写状态.-> State
-    Test -.读写状态.-> State
-    Fix -.读写状态.-> State
+    Coding -.读取快照并返回更新.-> State
+    Review -.读取快照并返回更新.-> State
+    Test -.读取快照并返回更新.-> State
+    Fix -.读取快照并返回更新.-> State
 
-    Engine[Workflow Engine]
-    Engine --> Coding
+    Engine[Workflow Engine] --> Coding
     Engine --> Review
     Engine --> Test
     Engine --> Fix
     Engine --> Report
 ```
+
+图中复测、复审分别复用 Test Agent、Review Agent；这是自动修复模式，所有节点还可能因异常提前结束并生成失败报告。
 
 ### 2.1 架构分层
 
@@ -78,7 +82,7 @@ flowchart TD
 - `CodingAgent.execute(StateView) -> AgentResult`
 - `CodingAgent.generate(requirements, context=...)`
 
-代码生成结果使用 `CodeGenerationResult` 等结构化数据表示。代码通过 AST 语法解析并不代表业务逻辑一定正确，因此仍需要后续测试和审查。
+代码生成结果使用 `CodeGenerationResult` 等结构化数据表示。初始生成只通过 `ast.parse` 检查 AST，没有执行 `compile`。例如函数外 `return`、循环外 `break` 等可能通过 AST 解析，却无法编译执行；CodeChecker 同样存在这一边界。Fix Agent 另外执行编译校验。AST 解析成功也不代表业务逻辑正确，因此仍需要后续测试和审查。
 
 ### 3.2 Review Agent：代码审查
 
@@ -181,6 +185,8 @@ flowchart TD
     Report --> End([结束])
 ```
 
+清洁基线不额外复审；只有改码后的复测会强制回到 Review。初始审查发现问题时也先完成基线测试，再根据两项结果和预算决定是否修复。
+
 ### 4.2 Workflow Engine
 
 主要实现位于 `workflow/`。
@@ -215,7 +221,7 @@ Engine 支持以下路由方式：
 - `create_fix_workflow()`：创建单节点修复工作流。
 - `create_repair_workflow()`：创建带修复预算和多轮反馈的自动修复工作流。
 
-单轮修复和自动修复循环是不同的执行模式。单轮模式完成一次修复和配置好的复验；自动循环模式则需要完整的 Review、Fix、Test 节点来持续验证结果。
+单轮修复和自动修复循环是不同的执行模式。未设置 `max_fix_attempts` 时，`create_coding_workflow()` 完成一次修复和已配置的复验；同时配置 Review、Test 时，改码后的顺序是 `verify_review → verify_test`。设置预算后的自动循环模式需要完整的 Review、Fix、Test，改码后按 `Test → Review` 验证。`create_fix_workflow()` 本身只执行 Fix，不自动复验；缺少当前验收证据时报告为 `unresolved`。
 
 ## 5. 状态共享与数据传递
 
@@ -313,11 +319,13 @@ Workflow Engine 在节点成功执行后统一提交这些变更，并记录对�
 
 默认最大修复次数为 3，可以通过 `max_fix_attempts` 配置。设置为 0 时，只进行诊断和基线验证，不执行自动修复。
 
-每轮循环主要经过以下阶段：
+首次修复前先完成 `Review → 基线 Test`。每次代码发生变化的修复轮执行：
 
 ```text
-Review → Fix → Test → Review
+Fix → Test 复测 → Review 复审 → 结果与预算判断
 ```
+
+未改码时直接以 `no_change` 停止，不进入该轮复测。
 
 每轮修复都使用当前代码、最新审查结果和测试失败证据。修复后必须通过复验，才能认定问题已经解决。
 
@@ -355,11 +363,11 @@ Fix Agent 还包含与工作流循环不同的内部语法重试机制。
 
 当前规则包括：
 
-- `syntax-error`：捕获 Python 语法错误。
+- `syntax-error`：捕获 AST 解析报告的语法错误，不覆盖全部编译阶段错误。
 - `bare-except`：检查未指定异常类型的 `except:`。
 - `division-by-zero`：检查除法、整除和取模操作中的常量零分母。
 
-CodeChecker 不导入或执行被审查代码。当前规则集较小，不能替代完整的静态分析工具。
+CodeChecker 不导入或执行被审查代码。当前规则集较小，不能替代完整的静态分析工具。除零规则只检查右操作数是否为数值零，没有推断左操作数类型；例如合法的字符串格式化 `"value=%s" % 0` 也会被误报为除零。当前不应将该规则的所有结果描述为必然发生的运行错误。
 
 ### 7.2 Reviewer 与代码生成供应商
 
@@ -368,6 +376,8 @@ CodeChecker 不导入或执行被审查代码。当前规则集较小，不能�
 项目通过 Protocol 将 Agent 与具体供应商实现分离，并支持 Mock 模式，以便在没有有效 API Key 的情况下验证主要流程。
 
 真实模型输出仍需要进行结构校验和必要的语法验证。符合数据结构要求不代表生成内容一定正确，因此最终验收依赖实际审查和测试结果。
+
+当前 `FIX_SYSTEM_PROMPT` 还包含特定注册场景的固定规则：密码基础校验后先检测弱密码；修复 `register_user` 时要求非字母数字且非空白的特殊字符，并在大写、小写、数字中至少满足两类。这些规则属于当前实现，并非由每次用户需求动态推导；遇到其他密码策略或校验顺序时可能与需求冲突。因此不能把通用“按需求最小修复”的原则理解为已消除所有场景限制。默认 add Demo 不覆盖该行为，也不能证明真实模型始终遵守这些提示。
 
 ### 7.3 FileEditor
 
@@ -381,7 +391,9 @@ CodeChecker 不导入或执行被审查代码。当前规则集较小，不能�
 
 ### 7.4 测试执行隔离
 
-Test Agent 使用独立子进程运行生成的测试，并提供超时控制和输出限制。
+Test Agent 使用独立子进程运行生成的测试，并分别提供执行超时控制和返回报告的输出截断。
+
+`timeout_seconds` 默认 10 秒，Demo 显式设置为 5 秒。stdout、stderr 在运行期间直接写入临时日志文件；进程结束或因超时终止后，`_read_output()` 才从每个文件读取前 `max_output_bytes` 字节，默认各 64 KiB，再按需要附加“输出已截断”提示。该参数不限制运行期间日志文件的大小，也不是磁盘、内存或 CPU 配额。`result.json` 的 1 MiB 检查同样发生在执行之后，不是写入期间的文件大小限制。
 
 这种方式能够限制测试进程对主工作流的影响，但不是完整的操作系统安全沙箱。被测代码仍可能拥有当前用户的文件和网络访问权限，因此不应将该机制描述为能够安全执行任意不可信代码。
 
@@ -403,7 +415,7 @@ Test Agent 使用独立子进程运行生成的测试，并提供超时控制和
 
 ### 8.2 最终报告
 
-`workflow/report.py` 根据终态 `WorkflowState` 生成不可变的 `WorkflowReport`。
+`workflow/report.py` 根据终态 `WorkflowState` 生成顶层冻结、与原状态隔离的 `WorkflowReport`。`frozen=True` 防止直接重新赋值报告字段；其中的 Pydantic 模型、列表和其他嵌套业务值仍可能可变，因此不保证深度不可变。修改报告中的这些副本不应修改原状态。
 
 报告包含：
 
@@ -416,7 +428,7 @@ Test Agent 使用独立子进程运行生成的测试，并提供超时控制和
 
 报告通过 `WorkflowOutcome` 区分引擎执行状态与任务验收结果：
 
-- `succeeded`：工作流正常完成，任务验收条件满足。
+- `succeeded`：工作流正常完成，已有的验收证据没有阻断结果，也没有已记录的待复验要求；没有配置的审查或测试不会自动补充执行。
 - `unresolved`：工作流完成，但任务仍存在未解决问题。
 - `failed`：执行过程中出现导致工作流失败的异常。
 
@@ -446,7 +458,7 @@ Workflow Engine 会保留可用的失败状态，并通过 `WorkflowExecutionErr
 
 系统尽可能避免无效结果覆盖已有的有效代码和诊断信息。
 
-修复输出在通过必要的结构和语法校验之前不会作为成功的代码变更提交。修复后的代码还必须通过后续测试和审查，才能确认任务已经解决。
+修复输出在通过结构和编译校验之前不会作为成功的代码变更提交。自动循环中的改码结果还必须通过后续测试和审查；单轮模式按已启用的检查复验。生成或修复节点完成，不等于未配置的业务验收也已通过。
 
 ## 10. 项目结构
 
@@ -478,7 +490,7 @@ intelligent-agent-workflow/
 
 ### 11.1 环境准备
 
-建议使用 Python 虚拟环境，并按照项目依赖文件安装所需依赖。
+要求 Python >=3.10。建议使用 Python 虚拟环境，并区分运行依赖和 pytest 测试依赖。
 
 ```bash
 python -m venv .venv
@@ -490,11 +502,19 @@ Windows 下激活虚拟环境：
 .venv\Scripts\activate
 ```
 
-安装依赖：
+仅运行源码和离线 Demo：
 
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
+
+开发、运行 pytest 或使用安装后的命令行入口：
+
+```bash
+python -m pip install -e ".[test]"
+```
+
+`pyproject.toml` 的 `test` 可选依赖组声明 `pytest>=9.1.1,<10.0.0`，同时安装运行依赖。只安装 requirements.txt 不包含 pytest；此时仍可使用标准库 unittest。
 
 部分真实模型调用功能需要有效的模型服务配置。Mock 模式可用于离线验证支持的流程。
 
@@ -508,11 +528,23 @@ python demo.py
 
 ### 11.3 运行自动化测试
 
+安装 `.[test]` 后：
+
 ```bash
 python -m pytest -v
 ```
 
+仅安装运行依赖时：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 测试覆盖 Agent 行为、共享状态、条件路由、失败反馈、自动修复循环和报告生成等关键功能。
+
+### 11.4 CLI 退出码与验收结果
+
+`demo.py` 使用 WorkflowReport.succeeded，返回 0 表示成功，1 表示未解决或执行失败。`main.py` 启用自动修复预算时使用 `repair_succeeded`；未启用预算时，有测试则只按测试状态决定 0/1，无测试时正常完成返回 0。因此非循环 CLI 可能在仍有阻断审查问题时返回 0；自动化调用方不能把所有入口的 0 一律视为审查和测试都已通过，应结合当前审查、测试及 WorkflowReport 判断。
 
 ## 12. 测试与演示结果
 
@@ -525,10 +557,10 @@ python -m unittest discover -s tests -v
 python -m pytest -v
 ```
 
-已验证结果：
+2026-10-23 本地验证结果（Windows、Python 3.14.3、pytest 9.1.1；子测试为 pytest 单独统计的 unittest.subTest）：
 
-- unittest：222 项测试通过。
-- pytest：222 项测试、697 个子测试通过。
+- unittest：232 项测试通过。
+- pytest：232 项测试、704 个子测试通过。
 - 共 39 条 Pytest 警告。
 - 本次测试未报告失败或错误。
 
@@ -553,7 +585,16 @@ def add(a, b):
     return a + b
 ```
 
-该演示用于展示 Workflow 的编排、状态更新、条件分支和修复循环。演示结果不应被理解为真实模型在所有代码任务中都能保证修复成功。
+该演示使用确定性生成、审查、测试生成和修复供应商，TestRunner 则在真实子进程中执行断言。它展示 Workflow 的编排、状态更新、条件分支和修复循环，不验证真实模型在任意任务中的修复成功率。
+
+| Demo 参数 | 业务结果 / 退出码 | 阶段数 | 修复轮数 | 日志数 |
+|---|---|---|---|---|
+| 默认 | succeeded / 0 | 9 | 2 | 56 |
+| `--max-fix-attempts 0` | unresolved / 1 | 3 | 0 | 20 |
+| `--max-fix-attempts 1` | unresolved / 1 | 6 | 1 | 38 |
+| `--json` | succeeded / 0 | 9 | 2 | 56 |
+
+`--json` 在人类可读的演示内容之后附加完整报告 JSON，不是纯 JSON 输出。预算 0/1 的正常终止不代表任务已解决。
 
 ## 13. 可扩展性设计
 
@@ -592,6 +633,12 @@ def add(a, b):
 7. 测试子进程不是完整安全沙箱，不能用于无条件执行不可信代码。
 8. 自动修复有次数限制，也可能因无进展或异常提前终止，不能保证所有任务都能修复成功。
 9. 自动化测试通过说明已覆盖的测试行为符合预期，不等于所有可能输入和生产环境都不存在问题。
+
+10. TestRunner 的输出截断发生在读取阶段，运行期间日志文件大小不受 `max_output_bytes` 限制。
+11. WorkflowReport 顶层冻结和副本隔离不等于所有嵌套值深度不可变。
+12. 非循环 main.py 的成功退出码不保证审查无阻断问题；调用方应检查业务结果。
+13. 初始生成仅校验 AST；CodeChecker 的常量零规则可能误报字符串格式化。Fix Agent 编译校验不能消除这些初始检查限制。
+14. 当前修复提示词含固定注册密码规则，可能与其他任务的明确需求冲突，add Demo 不覆盖该限制。
 
 ## 15. 总结
 
