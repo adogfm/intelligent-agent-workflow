@@ -95,6 +95,13 @@ class FixAgent(BaseAgent):
         if run.changed:
             # Diagnostics refer to the old code until downstream verification runs.
             updates.update({
+                # Retain obligations across consecutive fixes, even if only
+                # one of the previous diagnostics has been refreshed so far.
+                "required_verifications": tuple(
+                    key for key in ("report", "test_result")
+                    if state.get(key) is not None
+                    or key in state.get("required_verifications", ())
+                ),
                 "report_before_fix": report,
                 "review_run_before_fix": state.get("review_run"),
                 "test_result_before_fix": test_result,

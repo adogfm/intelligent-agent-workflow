@@ -107,7 +107,9 @@ def generate_workflow_report(state: WorkflowState) -> WorkflowReport:
 
     outcome = _derive_outcome(state)
     test_results = tuple(_safe_copy(item) for item in state.test_results)
-    final_test_result = test_results[-1] if test_results else None
+    # History belongs to previous source revisions as well. A cleared current
+    # result means the modified code has not been tested yet.
+    final_test_result = _safe_copy(state.get("test_result"))
     agent_results = tuple(_copy_report_record(item) for item in state.agent_results)
     stage_records = tuple(_copy_report_record(item) for item in state.stage_history)
     latest_stages = tuple(_copy_report_record(item) for item in state.stages.values())
@@ -187,13 +189,27 @@ def _derive_outcome(state: WorkflowState) -> WorkflowOutcome:
         return WorkflowOutcome.FAILED
     if state.get("repair_succeeded") is False:
         return WorkflowOutcome.UNRESOLVED
+    if _pending_verifications(state):
+        return WorkflowOutcome.UNRESOLVED
     final_review = state.get("report")
     if final_review is not None and getattr(final_review, "issues", ()):
         return WorkflowOutcome.UNRESOLVED
-    final_test = state.latest_test_result
+    final_test = state.get("test_result")
     if final_test is not None and not _test_succeeded(final_test):
         return WorkflowOutcome.UNRESOLVED
     return WorkflowOutcome.SUCCEEDED
+
+
+def _pending_verifications(state: WorkflowState) -> tuple[str, ...]:
+    """Find enabled pre-fix checks that still lack current-source evidence."""
+
+    required = state.get("required_verifications", ())
+    return tuple(
+        key for key in ("report", "test_result")
+        if state.get(key) is None and (
+            key in required or state.get(f"{key}_before_fix") is not None
+        )
+    )
 
 
 def _summary(
@@ -207,6 +223,12 @@ def _summary(
         reason = state.get("repair_stop_reason")
         if reason:
             return f"Workflow 已结束，但问题未解决：{reason}"
+        pending = _pending_verifications(state)
+        if pending:
+            labels = {"report": "代码审查", "test_result": "测试"}
+            return "Workflow 已结束，但修改后的代码待复验：" + "、".join(
+                labels[key] for key in pending
+            )
         review = state.get("report")
         issues = getattr(review, "issues", ()) if review is not None else ()
         if issues:
