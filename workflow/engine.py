@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from workflow.agent import Agent, AgentResult
-from workflow.state import StateView, WorkflowState
+from workflow.state import StateView, WorkflowState, _copy_state_data
 
 if TYPE_CHECKING:
     from workflow.report import WorkflowReport
@@ -152,15 +152,17 @@ class WorkflowEngine:
                         f"Agent {step.agent.name!r} 必须返回 AgentResult，"
                         f"实际返回 {type(result).__name__}"
                     )
-                state.apply(result.updates, source=step.name)
-                state.record_agent_result(
+                # Execution records own their output; detach it before any
+                # commit so a copy failure cannot leave partial state behind.
+                execution_output = _copy_state_data(result.output)
+                routing_view = state.commit_agent_result(
                     agent=step.agent.name,
                     updates=result.updates,
                     output=result.output,
                     updated_keys=tuple(result.updates),
                     next_step=result.next_step,
                 )
-                next_step = self._resolve_next(step, state.snapshot(), result)
+                next_step = self._resolve_next(step, routing_view, result)
                 self._record_route(state, step, next_step)
                 state.complete_step()
                 executions.append(
@@ -168,7 +170,7 @@ class WorkflowEngine:
                         step=step.name,
                         agent=step.agent.name,
                         state_version=state.version,
-                        output=result.output,
+                        output=execution_output,
                     )
                 )
                 current = next_step

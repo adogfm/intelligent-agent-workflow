@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from copy import deepcopy
 from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from types import MappingProxyType
-from typing import Any
+from typing import Any, TypeVar
 
 from workflow.state import (
     AgentResultRecord,
@@ -17,7 +16,11 @@ from workflow.state import (
     StageStatus,
     WorkflowState,
     WorkflowStatus,
+    _copy_state_data,
 )
+
+
+RecordT = TypeVar("RecordT", AgentResultRecord, StageState, ExecutionLog)
 
 
 class WorkflowOutcome(str, Enum):
@@ -79,7 +82,7 @@ class WorkflowReport:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a JSON-compatible representation of the complete report."""
+        """Return JSON-compatible data, replacing cycles with diagnostics."""
 
         return _serialize(self)
 
@@ -92,7 +95,7 @@ def generate_workflow_report(state: WorkflowState) -> WorkflowReport:
     if state.status not in {WorkflowStatus.COMPLETED, WorkflowStatus.FAILED}:
         raise ValueError("只能为已完成或失败的 Workflow 生成最终报告")
 
-    logs = state.execution_logs
+    logs = tuple(_copy_report_record(item) for item in state.execution_logs)
     started_at = _event_time(logs, "workflow.started", first=True)
     completed_at = (
         _event_time(logs, "workflow.completed")
@@ -105,31 +108,26 @@ def generate_workflow_report(state: WorkflowState) -> WorkflowReport:
     outcome = _derive_outcome(state)
     test_results = tuple(_safe_copy(item) for item in state.test_results)
     final_test_result = test_results[-1] if test_results else None
-    agent_results = tuple(
-        replace(
-            item,
-            updates=MappingProxyType(_safe_copy(dict(item.updates))),
-            output=_safe_copy(item.output),
-        )
-        for item in state.agent_results
-    )
+    agent_results = tuple(_copy_report_record(item) for item in state.agent_results)
+    stage_records = tuple(_copy_report_record(item) for item in state.stage_history)
+    latest_stages = tuple(_copy_report_record(item) for item in state.stages.values())
     return WorkflowReport(
         generated_at=datetime.now(timezone.utc),
-        workflow_status=state.status,
+        workflow_status=_safe_copy(state.status),
         outcome=outcome,
         succeeded=outcome is WorkflowOutcome.SUCCEEDED,
         summary=_summary(state, outcome, final_test_result),
-        state_version=state.version,
-        iteration_count=state.iteration_count,
-        repair_iteration_count=state.repair_iteration_count,
+        state_version=_safe_copy(state.version),
+        iteration_count=_safe_copy(state.iteration_count),
+        repair_iteration_count=_safe_copy(state.repair_iteration_count),
         started_at=started_at,
         completed_at=completed_at,
         duration_seconds=duration,
-        error=state.error,
-        stages=_stage_reports(state),
-        stage_records=state.stage_history,
+        error=_safe_copy(state.error),
+        stages=_stage_reports(latest_stages, stage_records),
+        stage_records=stage_records,
         agent_results=agent_results,
-        repair_history=_safe_copy(state.repair_history),
+        repair_history=tuple(_safe_copy(item) for item in state.repair_history),
         test_results=test_results,
         final_review_result=_safe_copy(state.get("report")),
         final_test_result=final_test_result,
@@ -137,10 +135,13 @@ def generate_workflow_report(state: WorkflowState) -> WorkflowReport:
     )
 
 
-def _stage_reports(state: WorkflowState) -> tuple[StageReport, ...]:
+def _stage_reports(
+    stages: tuple[StageState, ...], stage_history: tuple[StageState, ...],
+) -> tuple[StageReport, ...]:
     reports: list[StageReport] = []
-    for name, latest in state.stages.items():
-        records = tuple(item for item in state.stage_history if item.name == name)
+    for latest in stages:
+        name = latest.name
+        records = tuple(item for item in stage_history if item.name == name)
         first_started = records[0].started_at if records else latest.started_at
         last_completed = records[-1].completed_at if records else latest.completed_at
         duration = sum(item.duration_seconds or 0.0 for item in records)
@@ -157,6 +158,28 @@ def _stage_reports(state: WorkflowState) -> tuple[StageReport, ...]:
             records=records,
         ))
     return tuple(reports)
+
+
+def _copy_report_record(record: RecordT) -> RecordT:
+    """Detach complete records, retaining structured failure diagnostics."""
+
+    try:
+        # Copy together so update keys, updated_keys, and output keep aliases.
+        return _copy_state_data(record)
+    except Exception:
+        # An unsafe field must not make the rest of a failure report unusable.
+        values = {}
+        for item in fields(record):
+            value = getattr(record, item.name)
+            if isinstance(record, AgentResultRecord) and item.name == "updates":
+                values[item.name] = MappingProxyType({
+                    _safe_copy(key): _safe_copy(item) for key, item in value.items()
+                })
+            elif isinstance(record, AgentResultRecord) and item.name == "updated_keys":
+                values[item.name] = tuple(_safe_copy(key) for key in value)
+            else:
+                values[item.name] = _safe_copy(value)
+        return replace(record, **values)
 
 
 def _derive_outcome(state: WorkflowState) -> WorkflowOutcome:
@@ -231,29 +254,55 @@ def _test_succeeded(result: Any) -> bool:
     )
 
 
-def _serialize(value: Any) -> Any:
+def _serialize(value: Any, active: set[int] | None = None) -> Any:
     if isinstance(value, Enum):
         return value.value
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, datetime):
         return value.isoformat()
-    if is_dataclass(value) and not isinstance(value, type):
-        return {item.name: _serialize(getattr(value, item.name)) for item in fields(value)}
-    if isinstance(value, Mapping):
-        return {str(key): _serialize(item) for key, item in value.items()}
-    if isinstance(value, (tuple, list, set, frozenset)):
-        return [_serialize(item) for item in value]
-    model_dump = getattr(value, "model_dump", None)
-    if callable(model_dump):
-        return _serialize(model_dump(mode="json"))
-    return repr(value)
+    if active is None:
+        active = set()
+    identity = id(value)
+    if identity in active:
+        return f"<circular reference: {type(value).__name__}>"
+    active.add(identity)
+    try:
+        if is_dataclass(value) and not isinstance(value, type):
+            return {
+                item.name: _serialize(getattr(value, item.name), active)
+                for item in fields(value)
+            }
+        if isinstance(value, Mapping):
+            return {str(key): _serialize(item, active) for key, item in value.items()}
+        if isinstance(value, (tuple, list, set, frozenset)):
+            return [_serialize(item, active) for item in value]
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            try:
+                payload = model_dump(mode="json")
+            except (ValueError, RecursionError):
+                # Model serializers may reject cycles before we can walk them.
+                return f"<unserializable {type(value).__name__}>"
+            return _serialize(payload, active)
+        return _safe_repr(value)
+    finally:
+        # A shared value in another branch is not a circular reference.
+        active.remove(identity)
 
 
 def _safe_copy(value: Any) -> Any:
     try:
-        return deepcopy(value)
+        return _copy_state_data(value)
     except Exception:
-        # Reporting must remain available for arbitrary third-party Agent
-        # outputs, including handles that cannot be deep-copied.
-        return value
+        # Keep failure reports available without exposing mutable originals.
+        return _safe_repr(value)
+
+
+def _safe_repr(value: Any) -> str:
+    try:
+        # repr may return a str subclass with references in instance data.
+        # Call str's implementation directly to bypass an overridden __str__.
+        return str.__str__(repr(value))
+    except Exception:
+        return f"<uncopyable {type(value).__name__}>"
